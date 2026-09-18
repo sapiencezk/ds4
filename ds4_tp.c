@@ -69,9 +69,22 @@ typedef struct {
     uint32_t gate_slot_start;
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
-    uint32_t pad;
+    uint32_t n_ranks;   /* TP rank count this side expects (2..MAX_RANKS) */
     uint64_t gate_slot_mask[DS4_TP_GATE_MASK_WORDS];
 } ds4_tp_hello_fixed;
+
+/* Leader->worker registration reply over the control star: the assigned
+ * rank, the common rank count, the data-mesh port, and one mesh listen
+ * address ("ip:port") per rank so every rank can dial lower ranks. */
+typedef struct {
+    uint32_t magic;     /* DS4_TP_MAGIC */
+    uint32_t version;
+    uint32_t rank;      /* assigned worker rank (1..n_ranks-1) */
+    uint32_t n_ranks;
+    uint32_t mesh_port; /* data-plane listen port for every rank */
+    uint32_t rdma_ok;   /* leader side has a usable verbs device */
+    uint8_t mesh_addr[DS4_TP_MAX_RANKS][64]; /* "ip:port" per rank 0..N-1 */
+} ds4_tp_mesh_reply;
 
 typedef struct {
     uint64_t slab_base;
@@ -179,12 +192,29 @@ typedef struct {
 } ds4_tp_rdma;
 #endif
 
+/* Per-peer state for ranks beyond the scalar peer-rank-1 connection.  The
+ * historical control_fd/data_fd/rdma scalars stay the peer-rank-1 link so
+ * N=2 is byte-identical; peers[i] (rank i) hold every other peer's link and,
+ * under RDMA, its own queue pair.  Indexed by peer rank; peers[0] is the
+ * leader link on worker ranks, unused on the leader itself. */
+typedef struct ds4_tp_peer {
+    int control_fd;             /* -1 if not connected (leader side only) */
+    int data_fd;                /* -1 if no mesh link */
+    uint8_t mesh_addr[64];      /* "ip:port" this peer listens on, for dials */
+#ifdef DS4_TP_HAVE_VERBS
+    ds4_tp_rdma rdma;           /* per-peer QP/CQ + exchange state */
+#endif
+} ds4_tp_peer;
+
 struct ds4_tp {
     ds4_tp_options opt;
-    int rank;                   /* 0 leader, 1 worker */
-    int control_fd;
-    int data_fd;                /* TCP fallback, headers, and verify gates */
+    int rank;                   /* 0 leader, 1..n_ranks-1 workers */
+    uint32_t n_ranks;           /* 2..DS4_TP_MAX_RANKS */
+    uint32_t mesh_port;         /* data-plane listen port (listen_port+1) */
+    int control_fd;             /* control link to peer rank 1 (leader: worker1; worker: leader) */
+    int data_fd;                /* mesh data link to peer rank 1 (see peers) */
     bool rdma_active;
+    ds4_tp_peer peers[DS4_TP_MAX_RANKS]; /* peers[i] = peer with rank i, i != rank */
     uint32_t peer_ctx;
     uint32_t n_layer;
     uint32_t n_embd;
@@ -305,7 +335,8 @@ static void tp_iov_advance(struct msghdr *msg, size_t bytes) {
 }
 
 /* Keep both directions moving even if the kernel clamps the socket buffers. */
-static int tp_tcp_exchange_io(ds4_tp *tp, ds4_tp_gate_header *header,
+static int tp_tcp_exchange_io(ds4_tp *tp, int data_fd,
+                              ds4_tp_gate_header *header,
                               ds4_tp_gate_header *peer_header,
                               const void *out, void *in, size_t bytes) {
     struct iovec tx[] = {{header, sizeof(*header)}, {(void *)out, bytes}};
@@ -321,13 +352,13 @@ static int tp_tcp_exchange_io(ds4_tp *tp, ds4_tp_gate_header *header,
 #ifdef MSG_NOSIGNAL
             flags |= MSG_NOSIGNAL;
 #endif
-            ssize_t n = sendmsg(tp->data_fd, &send_msg, flags);
+            ssize_t n = sendmsg(data_fd, &send_msg, flags);
             if (n > 0) { tp_iov_advance(&send_msg, (size_t)n); progress = 1; }
             else if (n == 0) { errno = EPIPE; return 0; }
             else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return 0;
         }
         if (recv_msg.msg_iovlen) {
-            ssize_t n = recvmsg(tp->data_fd, &recv_msg, MSG_DONTWAIT);
+            ssize_t n = recvmsg(data_fd, &recv_msg, MSG_DONTWAIT);
             if (n > 0) { tp_iov_advance(&recv_msg, (size_t)n); progress = 1; }
             else if (n == 0) { errno = ECONNRESET; return 0; }
             else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return 0;
@@ -335,7 +366,7 @@ static int tp_tcp_exchange_io(ds4_tp *tp, ds4_tp_gate_header *header,
         if (progress) { deadline = tp_now_sec() + timeout; continue; }
         const double remaining_ms = (deadline - tp_now_sec()) * 1000.0;
         if (remaining_ms <= 0.0) { errno = ETIMEDOUT; return 0; }
-        struct pollfd pfd = {.fd = tp->data_fd,
+        struct pollfd pfd = {.fd = data_fd,
             .events = (send_msg.msg_iovlen ? POLLOUT : 0) |
                       (recv_msg.msg_iovlen ? POLLIN : 0)};
         int wait_ms = remaining_ms >= INT_MAX ? INT_MAX : (int)remaining_ms + 1;
@@ -345,24 +376,36 @@ static int tp_tcp_exchange_io(ds4_tp *tp, ds4_tp_gate_header *header,
     return 1;
 }
 
-static int tp_tcp_exchange(ds4_tp *tp, ds4_tp_gate_header *header,
+static int tp_tcp_exchange(ds4_tp *tp, int data_fd,
+                           ds4_tp_gate_header *header,
                            ds4_tp_gate_header *peer_header,
                            const void *out, void *in, size_t bytes) {
 #ifdef __APPLE__
     /* Darwin sendmsg can block despite MSG_DONTWAIT. The data socket has
      * one exchange owner; restore its mode before blocking header I/O. */
-    const int flags = fcntl(tp->data_fd, F_GETFL);
+    const int flags = fcntl(data_fd, F_GETFL);
     if (flags < 0) return 0;
     const bool changed = !(flags & O_NONBLOCK);
-    if (changed && fcntl(tp->data_fd, F_SETFL, flags | O_NONBLOCK) < 0) return 0;
+    if (changed && fcntl(data_fd, F_SETFL, flags | O_NONBLOCK) < 0) return 0;
 #endif
-    const int ok = tp_tcp_exchange_io(tp, header, peer_header, out, in, bytes);
+    const int ok = tp_tcp_exchange_io(tp, data_fd, header, peer_header, out, in, bytes);
 #ifdef __APPLE__
     const int saved_errno = errno;
-    if (changed && fcntl(tp->data_fd, F_SETFL, flags) < 0) return 0;
+    if (changed && fcntl(data_fd, F_SETFL, flags) < 0) return 0;
     errno = saved_errno;
 #endif
     return ok;
+}
+
+/* Data-plane link for peer_rank.  Peer rank 1 keeps the historical scalar
+ * link; ranks 2..N-1 (and, on worker ranks, rank 0 = the leader) live in
+ * peers[]. */
+static int tp_peer_data_fd(const ds4_tp *tp, uint32_t peer_rank) {
+    /* N=2: the sole peer link is tp->data_fd.  In the N-way mesh tp->data_fd
+     * is the peer-rank-1 link (worker1), peers[i].data_fd the rest. */
+    if (tp->n_ranks <= 2) return tp->data_fd;
+    if (peer_rank == 1 && tp->rank != 1) return tp->data_fd;
+    return tp->peers[peer_rank].data_fd;
 }
 
 #ifdef DS4_TP_HAVE_VERBS
@@ -444,6 +487,19 @@ static int tp_dial(const char *host, int port, double timeout_sec, char *err, si
     return -1;
 }
 
+/* Source IPv4/IPv6 of an accepted peer, for building the data-mesh listen
+ * address ("ip:port") each worker is reachable at over Thunderbolt. */
+static int tp_peer_source_addr(int fd, char *buf, size_t buflen) {
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof(ss);
+    if (getpeername(fd, (struct sockaddr *)&ss, &len) != 0) return 0;
+    char host[NI_MAXHOST] = {0};
+    if (getnameinfo((struct sockaddr *)&ss, len, host, sizeof(host), NULL, 0,
+                    NI_NUMERICHOST) != 0) return 0;
+    snprintf(buf, buflen, "%s", host);
+    return 1;
+}
+
 static int tp_send_frame(int fd, uint32_t type, const void *payload, uint32_t bytes) {
     ds4_tp_frame_header h = { DS4_TP_MAGIC, type, bytes };
     if (!tp_write_full(fd, &h, sizeof(h))) return 0;
@@ -458,6 +514,18 @@ static int tp_read_frame_header(int fd, uint32_t *type, uint32_t *bytes) {
     *type = h.type;
     *bytes = h.bytes;
     return 1;
+}
+
+/* Data-mesh greet: the dialing peer announces its rank so the acceptor can
+ * tag the link.  One uint32 rank frame each way, no payload. */
+static int tp_send_mesh_rank(int fd, uint32_t rank) {
+    return tp_send_frame(fd, DS4_TP_FRAME_MESH, &rank, sizeof(rank));
+}
+static int tp_recv_mesh_rank(int fd, uint32_t *rank) {
+    uint32_t type = 0, bytes = 0;
+    if (!tp_read_frame_header(fd, &type, &bytes) ||
+        type != DS4_TP_FRAME_MESH || bytes != sizeof(*rank)) return 0;
+    return tp_read_full(fd, rank, sizeof(*rank));
 }
 
 /* ------------------------------------------------------------------------
@@ -521,6 +589,18 @@ int ds4_tp_parse_cli_arg(
     } else if (!strcmp(arg, "--debug-hash")) {
         if (i + 1 >= argc) goto missing;
         opt->debug_hash = atoi(argv[++i]);
+    } else if (!strcmp(arg, "--tp-ranks") || !strcmp(arg, "--tensor-parallel-ranks")) {
+        if (i + 1 >= argc) goto missing;
+        char *end = NULL;
+        errno = 0;
+        long value = strtol(argv[++i], &end, 10);
+        if (errno != 0 || !end || *end != '\0' ||
+            value < 2 || value > DS4_TP_MAX_RANKS) {
+            tp_set_err(err, errlen, "invalid %s %s (want 2..%d)", arg, argv[i],
+                       DS4_TP_MAX_RANKS);
+            return DS4_TP_CLI_ERROR;
+        }
+        opt->n_ranks = (int)value;
     } else {
         return DS4_TP_CLI_NOT_MATCHED;
     }
@@ -645,7 +725,20 @@ int ds4_tp_validate_engine_options(
 uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd) {
     uint64_t vec = (uint64_t)n_embd * sizeof(float);
     uint64_t slots = (uint64_t)n_layer * DS4_TP_GATES_PER_LAYER;
-    return slots * vec * 2 +    /* out + in vectors */
+    return slots * vec * 2 +    /* out + in vectors (N=2 in-region) */
+           slots * 8 * 2 +      /* in flags + out flag staging */
+           16 +                 /* token slot */
+           slots * 4 +          /* GPU-written gate-ready flags */
+           (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec * 2; /* batch out+in */
+}
+
+/* N-rank slab: the in region holds one S*vec block per peer (N-1 blocks).
+ * For N=2 this equals ds4_tp_slab_bytes(). */
+uint64_t ds4_tp_slab_bytes_for(uint32_t n_layer, uint32_t n_embd,
+                               uint32_t n_ranks) {
+    uint64_t vec = (uint64_t)n_embd * sizeof(float);
+    uint64_t slots = (uint64_t)n_layer * DS4_TP_GATES_PER_LAYER;
+    return slots * vec * n_ranks +  /* out + (N-1) in vectors */
            slots * 8 * 2 +      /* in flags + out flag staging */
            16 +                 /* token slot */
            slots * 4 +          /* GPU-written gate-ready flags */
@@ -655,9 +748,11 @@ uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd) {
 static void tp_slab_layout(ds4_tp *tp) {
     uint64_t vec = tp->vec_bytes;
     uint64_t slots = tp->n_slots;
+    /* n_ranks defaults to 2 when unset (0) so N=2 layout is identical. */
+    uint32_t nr = tp->n_ranks < 2 ? 2 : tp->n_ranks;
     tp->out_off = 0;
     tp->in_off = slots * vec;
-    tp->in_flags_off = tp->in_off + slots * vec;
+    tp->in_flags_off = tp->in_off + slots * vec * (nr - 1);
     tp->token_off = tp->in_flags_off + slots * 8;
     tp->out_flags_off = tp->token_off + 16;
     tp->gpu_flags_off = tp->out_flags_off + slots * 8;
@@ -683,6 +778,17 @@ uint64_t ds4_tp_slab_out_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate)
 
 uint64_t ds4_tp_slab_in_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate) {
     return tp->in_off + (uint64_t)tp_slot(tp, layer, gate) * tp->vec_bytes;
+}
+
+/* Peer's partial lands in the in-region ordered by rank with self removed:
+ * peer_rank p < rank keeps index p, else index p-1.  Leader reading worker1
+ * and worker1 reading the leader both index 0 (N=2: identical to
+ * ds4_tp_slab_in_offset). */
+uint64_t ds4_tp_slab_in_offset_peer(const ds4_tp *tp, uint32_t peer,
+                                    uint32_t layer, uint32_t gate) {
+    const uint32_t idx = peer < (uint32_t)tp->rank ? peer : peer - 1;
+    return tp->in_off + (uint64_t)idx * (uint64_t)tp->n_slots * tp->vec_bytes +
+           (uint64_t)tp_slot(tp, layer, gate) * tp->vec_bytes;
 }
 
 uint64_t ds4_tp_slab_batch_out_offset(const ds4_tp *tp, uint32_t layer) {
@@ -2006,6 +2112,309 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
     return 1;
 }
 
+/* ------------------------------------------------------------------------
+ * N-way (mesh) control registration.  Used only when n_ranks > 2; the
+ * n_ranks == 2 path keeps tp_hello_exchange above byte-identical.
+ * --------------------------------------------------------------------- */
+
+/* Validate a received worker hello against our own identity. */
+static int tp_validate_worker_hello(ds4_tp *tp, const ds4_tp_identity *id,
+                                    const ds4_tp_hello_fixed *theirs,
+                                    char *err, size_t errlen) {
+    if (theirs->magic != DS4_TP_MAGIC) {
+        tp_set_err(err, errlen, "tp hello: bad magic (mixed byte order or wrong peer?)");
+        return 0;
+    }
+    if (theirs->version != DS4_TP_PROTOCOL_VERSION) {
+        tp_set_err(err, errlen, "tp hello: protocol version %u != %u",
+                   theirs->version, DS4_TP_PROTOCOL_VERSION);
+        return 0;
+    }
+    if (theirs->role == (uint32_t)tp->opt.role) {
+        tp_set_err(err, errlen, "tp hello: both sides claim role %u", theirs->role);
+        return 0;
+    }
+    if (theirs->gguf_bytes != id->gguf_bytes || theirs->model_id != id->model_id ||
+        theirs->n_layer != id->n_layer || theirs->n_embd != id->n_embd ||
+        theirs->n_vocab != id->n_vocab || theirs->quant_bits != id->quant_bits ||
+        theirs->gate_slot_start != id->gate_slot_start ||
+        theirs->gate_slot_step != id->gate_slot_step ||
+        theirs->gates_per_token != id->gates_per_token ||
+        memcmp(theirs->gate_slot_mask, id->gate_slot_mask,
+               sizeof(id->gate_slot_mask)) != 0) {
+        tp_set_err(err, errlen,
+                   "tp hello: model mismatch (peer gguf=%llu id=%u layers=%u embd=%u "
+                   "vocab=%u qbits=%u)",
+                   (unsigned long long)theirs->gguf_bytes, theirs->model_id,
+                   theirs->n_layer, theirs->n_embd, theirs->n_vocab,
+                   theirs->quant_bits);
+        return 0;
+    }
+    if (theirs->n_ranks != tp->n_ranks) {
+        tp_set_err(err, errlen, "tp hello: rank count %u != %u",
+                   theirs->n_ranks, tp->n_ranks);
+        return 0;
+    }
+    return 1;
+}
+
+/* Apply the model identity onto tp + compute the slab layout. */
+static void tp_apply_identity(ds4_tp *tp, const ds4_tp_identity *id) {
+    const uint32_t n_slots = id->n_layer * DS4_TP_GATES_PER_LAYER;
+    tp->n_layer = id->n_layer;
+    tp->n_embd = id->n_embd;
+    tp->vec_bytes = (uint64_t)id->n_embd * sizeof(float);
+    tp->n_slots = n_slots;
+    tp->gate_slot_start = id->gate_slot_start;
+    tp->gate_slot_step = id->gate_slot_step;
+    tp->gates_per_token = id->gates_per_token;
+    memcpy(tp->gate_slot_mask, id->gate_slot_mask, sizeof(tp->gate_slot_mask));
+    tp_slab_layout(tp);
+}
+
+/* Control-plane registration for n_ranks > 2.  Leader accepts n_ranks-1
+ * control connections, validates each worker hello, assigns ranks, captures
+ * each worker's source address, and broadcasts the mesh address list back.
+ * Worker dials the leader, sends its hello, and reads the reply. */
+static int tp_hello_exchange_mesh(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
+                                  char *err, size_t errlen, int listener) {
+    const uint32_t n = tp->n_ranks;
+    ds4_tp_hello_fixed mine;
+    memset(&mine, 0, sizeof(mine));
+    mine.magic = DS4_TP_MAGIC;
+    mine.version = DS4_TP_PROTOCOL_VERSION;
+    mine.role = (uint32_t)tp->opt.role;
+    mine.rdma_ok = (uint32_t)rdma_ok;
+    mine.gguf_bytes = id->gguf_bytes;
+    mine.model_id = id->model_id;
+    mine.n_layer = id->n_layer;
+    mine.n_embd = id->n_embd;
+    mine.n_vocab = id->n_vocab;
+    mine.quant_bits = id->quant_bits;
+    mine.ctx_size = id->ctx_size;
+    mine.gate_slot_start = id->gate_slot_start;
+    mine.gate_slot_step = id->gate_slot_step;
+    mine.gates_per_token = id->gates_per_token;
+    mine.n_ranks = n;
+    memcpy(mine.gate_slot_mask, id->gate_slot_mask, sizeof(mine.gate_slot_mask));
+
+    if (tp->rank == 0) {
+        /* Leader: accept + register every worker. */
+        uint32_t worker_rdma[DS4_TP_MAX_RANKS] = {0};
+        ds4_tp_mesh_reply rep;
+        memset(&rep, 0, sizeof(rep));
+        rep.magic = DS4_TP_MAGIC;
+        rep.version = DS4_TP_PROTOCOL_VERSION;
+        rep.n_ranks = n;
+        rep.mesh_port = tp->mesh_port;
+        rep.rdma_ok = (uint32_t)rdma_ok;
+        /* mesh_addr[0] = leader (unused: workers dial the leader with their
+         * own leader_host); fill the workers' addresses as they register. */
+        const char *lh = tp->opt.listen_host ? tp->opt.listen_host : "0.0.0.0";
+        snprintf((char *)rep.mesh_addr[0], sizeof(rep.mesh_addr[0]), "%s:%u",
+                 lh, tp->mesh_port);
+        for (uint32_t p = 1; p < n; p++) {
+            int fd = accept(listener, NULL, NULL);
+            if (fd < 0) {
+                tp_set_err(err, errlen, "tp mesh accept: %s", strerror(errno));
+                return 0;
+            }
+            int *store = p == 1 ? &tp->control_fd : &tp->peers[p].control_fd;
+            *store = fd;
+            tp_socket_tune(fd);
+            ds4_tp_hello_fixed theirs;
+            if (!tp_read_full(fd, &theirs, sizeof(theirs))) {
+                tp_set_err(err, errlen, "tp mesh hello read (worker %u) failed", p);
+                return 0;
+            }
+            if (!tp_validate_worker_hello(tp, id, &theirs, err, errlen)) return 0;
+            worker_rdma[p] = theirs.rdma_ok;
+            char src[NI_MAXHOST] = {0};
+            tp_peer_source_addr(fd, src, sizeof(src));
+            snprintf((char *)rep.mesh_addr[p], sizeof(rep.mesh_addr[p]),
+                     "%s:%u", src, tp->mesh_port);
+            memcpy(tp->peers[p].mesh_addr, rep.mesh_addr[p], 64);
+            fprintf(stderr, "ds4-tp: worker %u registered at %s\n", p, src);
+        }
+        /* Send the full mesh list back to each worker over its control link. */
+        for (uint32_t p = 1; p < n; p++) {
+            rep.rank = p;
+            int fd = p == 1 ? tp->control_fd : tp->peers[p].control_fd;
+            if (!tp_write_full(fd, &rep, sizeof(rep))) {
+                tp_set_err(err, errlen, "tp mesh reply (worker %u) failed", p);
+                return 0;
+            }
+        }
+        tp_apply_identity(tp, id);
+        int want_rdma = tp->opt.transport != DS4_TP_TRANSPORT_TCP;
+        tp->rdma_active = want_rdma && rdma_ok;
+        for (uint32_t p = 1; p < n; p++) {
+            if (!worker_rdma[p]) tp->rdma_active = false;
+        }
+        if (tp->opt.transport == DS4_TP_TRANSPORT_RDMA && !tp->rdma_active) {
+            tp_set_err(err, errlen, "tp: --transport rdma but a worker has no active device");
+            return 0;
+        }
+        return 1;
+    }
+
+    /* Worker: dial leader, send hello, read the mesh reply. */
+    if (!tp_write_full(tp->control_fd, &mine, sizeof(mine))) {
+        tp_set_err(err, errlen, "tp mesh hello send failed");
+        return 0;
+    }
+    ds4_tp_mesh_reply rep;
+    if (!tp_read_full(tp->control_fd, &rep, sizeof(rep))) {
+        tp_set_err(err, errlen, "tp mesh reply read failed");
+        return 0;
+    }
+    if (rep.magic != DS4_TP_MAGIC) {
+        tp_set_err(err, errlen, "tp mesh: bad magic (mixed byte order or wrong peer?)");
+        return 0;
+    }
+    if (rep.version != DS4_TP_PROTOCOL_VERSION) {
+        tp_set_err(err, errlen, "tp mesh: protocol version %u != %u",
+                   rep.version, DS4_TP_PROTOCOL_VERSION);
+        return 0;
+    }
+    if (rep.rank >= n) {
+        tp_set_err(err, errlen, "tp mesh: assigned rank %u out of range", rep.rank);
+        return 0;
+    }
+    tp->rank = (int)rep.rank;
+    tp->n_ranks = rep.n_ranks;
+    tp->mesh_port = rep.mesh_port;
+    for (uint32_t i = 0; i < DS4_TP_MAX_RANKS; i++) {
+        memcpy(tp->peers[i].mesh_addr, rep.mesh_addr[i], 64);
+    }
+    tp_apply_identity(tp, id);
+    int want_rdma = tp->opt.transport != DS4_TP_TRANSPORT_TCP;
+    tp->rdma_active = want_rdma && rdma_ok && rep.rdma_ok;
+    if (tp->opt.transport == DS4_TP_TRANSPORT_RDMA && !tp->rdma_active) {
+        tp_set_err(err, errlen, "tp: --transport rdma but %s side has no active device",
+                   rdma_ok ? "the leader" : "this");
+        return 0;
+    }
+    fprintf(stderr, "ds4-tp: assigned rank %u of %u, mesh port %u\n",
+            tp->rank, tp->n_ranks, tp->mesh_port);
+    return 1;
+}
+
+/* Data-plane full mesh for n_ranks > 2.  Every rank dials lower ranks and
+ * accepts higher ranks on mesh_port.  Pair (i<j): rank i accepts, rank j
+ * dials and greets with its rank.  Peer 1's link is also stored on tp->data_fd
+ * so the peer1-only RDMA fallback paths keep working. */
+static int tp_data_mesh(ds4_tp *tp, char *err, size_t errlen) {
+    const uint32_t n = tp->n_ranks;
+    const uint32_t me = (uint32_t)tp->rank;
+    int dlistener = -1;
+
+    if (me == 0) {
+        /* Leader: bind mesh_port and accept one data link per worker. */
+        dlistener = tp_listen(tp->opt.listen_host, (int)tp->mesh_port, err, errlen);
+        if (dlistener < 0) return 0;
+        for (uint32_t p = 1; p < n; p++) {
+            int fd = accept(dlistener, NULL, NULL);
+            if (fd < 0) {
+                tp_set_err(err, errlen, "tp mesh data accept (worker %u): %s",
+                           p, strerror(errno));
+                close(dlistener);
+                return 0;
+            }
+            uint32_t pr = 0;
+            if (!tp_recv_mesh_rank(fd, &pr) || pr >= n) {
+                tp_set_err(err, errlen, "tp mesh data greet failed");
+                close(fd);
+                close(dlistener);
+                return 0;
+            }
+            int *store = pr == 1 ? &tp->data_fd : &tp->peers[pr].data_fd;
+            *store = fd;
+            tp_socket_tune(fd);
+            if (!tp_socket_set_gate_timeout(fd, tp->gate_timeout_ms)) {
+                tp_set_err(err, errlen, "tp mesh data socket timeout: %s",
+                           strerror(errno));
+                close(dlistener);
+                return 0;
+            }
+            fprintf(stderr, "ds4-tp: data link from worker %u\n", pr);
+        }
+        close(dlistener);
+        return 1;
+    }
+
+    /* Worker: bind mesh_port, accept higher ranks, dial lower ranks. */
+    dlistener = tp_listen(NULL, (int)tp->mesh_port, err, errlen);
+    if (dlistener < 0) return 0;
+    /* Accept peers with rank > me.  Higher ranks dial concurrently, so the
+     * arrival order is not rank order: tag each link by the greeted rank. */
+    uint32_t accepted = 0;
+    while (accepted < n - 1 - me) {
+        int fd = accept(dlistener, NULL, NULL);
+        if (fd < 0) {
+            tp_set_err(err, errlen, "tp mesh data accept: %s", strerror(errno));
+            close(dlistener);
+            return 0;
+        }
+        uint32_t pr = 0;
+        if (!tp_recv_mesh_rank(fd, &pr) || pr <= me || pr >= n) {
+            tp_set_err(err, errlen, "tp mesh data greet invalid (got %u)", pr);
+            close(fd);
+            close(dlistener);
+            return 0;
+        }
+        tp->peers[pr].data_fd = fd;
+        accepted++;
+        tp_socket_tune(fd);
+        if (!tp_socket_set_gate_timeout(fd, tp->gate_timeout_ms)) {
+            tp_set_err(err, errlen, "tp mesh data socket timeout: %s",
+                       strerror(errno));
+            close(dlistener);
+            return 0;
+        }
+    }
+    close(dlistener);
+    /* Dial peers with rank < me. */
+    for (uint32_t p = 0; p < me; p++) {
+        const char *host;
+        uint32_t port;
+        if (p == 0) {
+            host = tp->opt.leader_host;
+            port = tp->mesh_port;
+        } else {
+            char *colon = strchr((char *)tp->peers[p].mesh_addr, ':');
+            if (!colon) {
+                tp_set_err(err, errlen, "tp mesh: bad peer %u address", p);
+                return 0;
+            }
+            *colon = '\0';
+            host = (char *)tp->peers[p].mesh_addr;
+            port = (uint32_t)atoi(colon + 1);
+        }
+        int fd = tp_dial(host, (int)port, (double)tp->timeout_sec, err, errlen);
+        if (fd < 0) return 0;
+        tp_socket_tune(fd);
+        if (!tp_socket_set_gate_timeout(fd, tp->gate_timeout_ms)) {
+            tp_set_err(err, errlen, "tp mesh data socket timeout: %s",
+                       strerror(errno));
+            close(fd);
+            return 0;
+        }
+        if (!tp_send_mesh_rank(fd, me)) {
+            tp_set_err(err, errlen, "tp mesh data greet send failed");
+            close(fd);
+            return 0;
+        }
+        int *store = p == 1 ? &tp->data_fd : &tp->peers[p].data_fd;
+        *store = fd;
+        fprintf(stderr, "ds4-tp: data link to peer %u at %s:%u\n", p, host, port);
+    }
+    /* Worker rank 1 dials only the leader (p=0), so its scalar data_fd (the
+     * peer-rank-1 link) must be the leader link for the peer1-only paths. */
+    if (me == 1) tp->data_fd = tp->peers[0].data_fd;
+    return 1;
+}
+
 int ds4_tp_create(
         ds4_tp **out,
         const ds4_tp_options *opt,
@@ -2021,6 +2430,10 @@ int ds4_tp_create(
     }
     tp->opt = *opt;
     tp->rank = opt->role == DS4_TP_LEADER ? 0 : 1;
+    tp->n_ranks = opt->n_ranks < 2 ? 2 :
+                  opt->n_ranks > DS4_TP_MAX_RANKS ? DS4_TP_MAX_RANKS :
+                  (uint32_t)opt->n_ranks;
+    tp->mesh_port = (uint32_t)opt->listen_port + 1;
     tp->control_fd = -1;
     tp->data_fd = -1;
     tp->timeout_sec = DS4_TP_DEFAULT_TIMEOUT_SEC;
@@ -2041,55 +2454,87 @@ int ds4_tp_create(
 #endif
 
     int listener = -1;
+    if (tp->n_ranks == 2) {
+        /* ---- N=2 path: single peer, existing wire (byte-identical). ---- */
+        if (tp->rank == 0) {
+            listener = tp_listen(opt->listen_host, opt->listen_port, err, errlen);
+            if (listener < 0) goto fail;
+            fprintf(stderr, "ds4-tp: waiting for worker on %s:%d ...\n",
+                    opt->listen_host ? opt->listen_host : "0.0.0.0", opt->listen_port);
+            tp->control_fd = accept(listener, NULL, NULL);
+            if (tp->control_fd < 0) {
+                tp_set_err(err, errlen, "tp accept: %s", strerror(errno));
+                goto fail;
+            }
+        } else {
+            tp->control_fd = tp_dial(opt->leader_host, opt->leader_port,
+                                     (double)tp->timeout_sec, err, errlen);
+            if (tp->control_fd < 0) goto fail;
+        }
+        tp_socket_tune(tp->control_fd);
+
+        if (!tp_hello_exchange(tp, id, rdma_ok, err, errlen)) goto fail;
+
+#ifdef DS4_TP_HAVE_VERBS
+        if (tp->rdma_active) {
+            if (!tp_rdma_open(tp, err, errlen)) goto fail;
+        }
+#endif
+        {
+            /* Second socket dedicated to gate traffic so control frames never
+             * interleave with gate payloads.  Created under RDMA too for
+             * headers, verify-block gates, and transport fallback. */
+            if (tp->rank == 0) {
+                tp->data_fd = accept(listener, NULL, NULL);
+                if (tp->data_fd < 0) {
+                    tp_set_err(err, errlen, "tp data accept: %s", strerror(errno));
+                    goto fail;
+                }
+            } else {
+                tp->data_fd = tp_dial(opt->leader_host, opt->leader_port,
+                                      (double)tp->timeout_sec, err, errlen);
+                if (tp->data_fd < 0) goto fail;
+            }
+            tp_socket_tune(tp->data_fd);
+            if (!tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms)) {
+                tp_set_err(err, errlen, "tp data socket timeout: %s", strerror(errno));
+                goto fail;
+            }
+        }
+        if (listener >= 0) close(listener);
+        fprintf(stderr, "ds4-tp: %s connected, transport=%s gate-timeout=%llums\n",
+                tp->rank == 0 ? "worker" : "leader",
+                tp->rdma_active ? "rdma" : "tcp",
+                (unsigned long long)tp->gate_timeout_ms);
+        *out = tp;
+        return 1;
+    }
+
+    /* ---- N-way mesh path (n_ranks > 2). ---- */
     if (tp->rank == 0) {
         listener = tp_listen(opt->listen_host, opt->listen_port, err, errlen);
         if (listener < 0) goto fail;
-        fprintf(stderr, "ds4-tp: waiting for worker on %s:%d ...\n",
+        fprintf(stderr, "ds4-tp: waiting for %u workers on %s:%d ...\n",
+                tp->n_ranks - 1,
                 opt->listen_host ? opt->listen_host : "0.0.0.0", opt->listen_port);
-        tp->control_fd = accept(listener, NULL, NULL);
-        if (tp->control_fd < 0) {
-            tp_set_err(err, errlen, "tp accept: %s", strerror(errno));
-            goto fail;
-        }
     } else {
         tp->control_fd = tp_dial(opt->leader_host, opt->leader_port,
                                  (double)tp->timeout_sec, err, errlen);
         if (tp->control_fd < 0) goto fail;
+        tp_socket_tune(tp->control_fd);
     }
-    tp_socket_tune(tp->control_fd);
-
-    if (!tp_hello_exchange(tp, id, rdma_ok, err, errlen)) goto fail;
+    if (!tp_hello_exchange_mesh(tp, id, rdma_ok, err, errlen, listener)) goto fail;
+    if (listener >= 0) close(listener);
+    listener = -1;
 
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active) {
         if (!tp_rdma_open(tp, err, errlen)) goto fail;
     }
 #endif
-    {
-        /* Second socket dedicated to gate traffic so control frames never
-         * interleave with gate payloads.  Created under RDMA too for
-         * headers, verify-block gates, and transport fallback. */
-        if (tp->rank == 0) {
-            tp->data_fd = accept(listener, NULL, NULL);
-            if (tp->data_fd < 0) {
-                tp_set_err(err, errlen, "tp data accept: %s", strerror(errno));
-                goto fail;
-            }
-        } else {
-            tp->data_fd = tp_dial(opt->leader_host, opt->leader_port,
-                                  (double)tp->timeout_sec, err, errlen);
-            if (tp->data_fd < 0) goto fail;
-        }
-        tp_socket_tune(tp->data_fd);
-        if (!tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms)) {
-            tp_set_err(err, errlen, "tp data socket timeout: %s", strerror(errno));
-            goto fail;
-        }
-    }
-    if (listener >= 0) close(listener);
-    fprintf(stderr, "ds4-tp: %s connected, transport=%s gate-timeout=%llums\n",
-            tp->rank == 0 ? "worker" : "leader",
-            tp->rdma_active ? "rdma" : "tcp",
+    if (!tp_data_mesh(tp, err, errlen)) goto fail;
+    fprintf(stderr, "ds4-tp: mesh ready (%u ranks), transport=%s gate-timeout=%llums\n",
+            tp->n_ranks, tp->rdma_active ? "rdma" : "tcp",
             (unsigned long long)tp->gate_timeout_ms);
     *out = tp;
     return 1;
@@ -2127,6 +2572,10 @@ void ds4_tp_free(ds4_tp *tp) {
 #endif
     if (tp->control_fd >= 0) close(tp->control_fd);
     if (tp->data_fd >= 0) close(tp->data_fd);
+    for (uint32_t i = 0; i < DS4_TP_MAX_RANKS; i++) {
+        if (tp->peers[i].control_fd >= 0) close(tp->peers[i].control_fd);
+        if (tp->peers[i].data_fd >= 0) close(tp->peers[i].data_fd);
+    }
     free(tp);
 }
 
@@ -2141,6 +2590,7 @@ void ds4_tp_detach_slab(ds4_tp *tp) {
 }
 
 int ds4_tp_rank(const ds4_tp *tp) { return tp->rank; }
+int ds4_tp_n_ranks(const ds4_tp *tp) { return tp ? (int)tp->n_ranks : 0; }
 bool ds4_tp_is_rdma(const ds4_tp *tp) { return tp->rdma_active; }
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp) { return tp->peer_ctx; }
 bool ds4_tp_failed(const ds4_tp *tp) {
@@ -2154,21 +2604,45 @@ void ds4_tp_mark_failed(ds4_tp *tp) {
  * Gate exchange.
  * --------------------------------------------------------------------- */
 
-int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
-#ifdef DS4_TP_HAVE_VERBS
-    if (tp->rdma_active) return tp_rdma_gate_exchange(tp, layer, gate, seq);
-#endif
-    /* Send header and payload together without depending on socket capacity. */
+/* TCP exchange of one gate partial with one peer.  Writes our out vector to
+ * the peer's data link, reads the peer's partial into our in-region slot for
+ * that peer, and validates the echoed header. */
+static int tp_tcp_gate_exchange_peer(ds4_tp *tp, uint32_t peer, uint32_t layer,
+                                     uint32_t gate, uint64_t seq) {
     ds4_tp_gate_header h = { DS4_TP_MAGIC, (uint16_t)layer, (uint16_t)gate, seq };
     ds4_tp_gate_header ph;
-    if (!tp_tcp_exchange(tp, &h, &ph,
+    if (!tp_tcp_exchange(tp, tp_peer_data_fd(tp, peer), &h, &ph,
             tp->slab + ds4_tp_slab_out_offset(tp, layer, gate),
-            tp->slab + ds4_tp_slab_in_offset(tp, layer, gate), tp->vec_bytes)) return 0;
+            tp->slab + ds4_tp_slab_in_offset_peer(tp, peer, layer, gate),
+            tp->vec_bytes)) return 0;
     if (ph.magic != DS4_TP_MAGIC || ph.layer != layer || ph.gate != gate || ph.seq != seq) {
-        fprintf(stderr, "ds4-tp: gate desync: got l=%u g=%u seq=%llu, want l=%u g=%u seq=%llu\n",
-                ph.layer, ph.gate, (unsigned long long)ph.seq,
+        fprintf(stderr, "ds4-tp: gate desync (peer %u): got l=%u g=%u seq=%llu, want l=%u g=%u seq=%llu\n",
+                peer, ph.layer, ph.gate, (unsigned long long)ph.seq,
                 layer, gate, (unsigned long long)seq);
         return 0;
+    }
+    return 1;
+}
+
+/* All-reduce one gate partial across every peer: peer1 via the existing RDMA
+ * decode path when RDMA is active (its single-QP receive window), peers
+ * 2..N-1 via the TCP fallback until the RDMA N-way decode path lands
+ * (documented remaining scope); with a plain TCP transport every peer uses
+ * TCP.  For N=2 this is exactly the original single-peer exchange. */
+int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
+    uint32_t pr;
+#ifdef DS4_TP_HAVE_VERBS
+    if (tp->rdma_active) {
+        if (!tp_rdma_gate_exchange(tp, layer, gate, seq)) return 0;
+        for (pr = 2; pr < tp->n_ranks; pr++) {
+            if (!tp_tcp_gate_exchange_peer(tp, pr, layer, gate, seq)) return 0;
+        }
+        return 1;
+    }
+#endif
+    for (pr = 0; pr < tp->n_ranks; pr++) {
+        if (pr == (uint32_t)tp->rank) continue;
+        if (!tp_tcp_gate_exchange_peer(tp, pr, layer, gate, seq)) return 0;
     }
     return 1;
 }
@@ -2269,7 +2743,7 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
     }
 #endif
     ds4_tp_gate_header ph;
-    if (!tp_tcp_exchange(tp, &h, &ph,
+    if (!tp_tcp_exchange(tp, tp->data_fd, &h, &ph,
             tp->slab + ds4_tp_slab_batch_out_offset(tp, layer),
             tp->slab + ds4_tp_slab_batch_in_offset(tp, layer), bytes)) return 0;
     if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
@@ -2342,7 +2816,7 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
         return ok;
     }
 #endif
-    if (!tp_tcp_exchange(tp, NULL, NULL, out, in, bytes)) {
+    if (!tp_tcp_exchange(tp, tp->data_fd, NULL, NULL, out, in, bytes)) {
         fprintf(stderr, "ds4-tp: big gate payload exchange failed (layer %u): %s\n",
                 layer, strerror(errno));
         return 0;

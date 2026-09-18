@@ -45,7 +45,7 @@ static void *exchange(void *arg) {
         /* Bulk framing requires blocking I/O. An already-nonblocking socket
          * only exercises the exchange helper's descriptor-mode preservation. */
         const int ok = p->nonblocking ?
-            tp_tcp_exchange(tp, NULL, NULL, out, in, lengths[i]) :
+            tp_tcp_exchange(tp, tp->data_fd, NULL, NULL, out, in, lengths[i]) :
             ds4_tp_big_gate_exchange(tp, 0, i, out, in, lengths[i]);
         if (!ok) {
             p->result = 0;
@@ -98,18 +98,18 @@ static void check_stall_and_close(bool tcp) {
     assert(flags >= 0 && !(flags & O_NONBLOCK));
     char out[32768] = {0}, in[32768];
     double start = tp_now_sec();
-    assert(!tp_tcp_exchange(&tp, NULL, NULL, out, in, sizeof(out)));
+    assert(!tp_tcp_exchange(&tp, tp.data_fd, NULL, NULL, out, in, sizeof(out)));
     assert(errno == ETIMEDOUT && tp_now_sec() - start < 1.0);
     assert(fcntl(fd[0], F_GETFL) == flags);
     close(fd[0]); close(fd[1]);
     pair(fd, tcp);
     tp.data_fd = fd[0];
     assert(shutdown(fd[1], SHUT_WR) == 0);
-    assert(!tp_tcp_exchange(&tp, NULL, NULL, out, in, sizeof(out)));
+    assert(!tp_tcp_exchange(&tp, tp.data_fd, NULL, NULL, out, in, sizeof(out)));
     assert(errno == ECONNRESET);
     assert(fcntl(fd[0], F_GETFL) == flags);
     close(fd[1]);
-    assert(!tp_tcp_exchange(&tp, NULL, NULL, out, in, sizeof(out)));
+    assert(!tp_tcp_exchange(&tp, tp.data_fd, NULL, NULL, out, in, sizeof(out)));
     close(fd[0]);
     puts("TCP stalled, half-closed and disconnected peers: PASS");
 }
@@ -129,7 +129,8 @@ static void check_exchange(bool tcp, bool nonblocking) {
         }
         peer[i].rank = i;
         peer[i].nonblocking = nonblocking;
-        peer[i].tp = (ds4_tp){.data_fd = fd[i], .n_layer = 40, .n_slots = 80,
+        peer[i].tp = (ds4_tp){.data_fd = fd[i], .rank = i, .n_ranks = 2,
+            .n_layer = 40, .n_slots = 80,
             .n_embd = 5120, .vec_bytes = 5120 * 4, .gate_timeout_ms = 1000};
         tp_slab_layout(&peer[i].tp);
         peer[i].tp.slab = calloc(1, peer[i].tp.slab_bytes);

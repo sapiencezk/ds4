@@ -10,18 +10,29 @@
 
 /* Tensor-parallel transport and lockstep protocol.
  *
- * Two ranks run the same logical model, each with one contiguous half of the
- * routed experts resident. Rank 0 (leader) is a normal frontend session that
- * mirrors every ds4_session_sync()/ds4_session_eval() call to rank 1 (worker)
- * over a TCP control socket, so both engines execute the identical graph
- * sequence.
- * Inside each decoded token, partial block outputs are exchanged through a
- * registered memory slab: two-sided RDMA SEND/RECV when RDMA over
- * Thunderbolt is available, or a full-duplex TCP exchange as fallback.
+ * N ranks (2..DS4_TP_MAX_RANKS) run the same logical model, each holding a
+ * contiguous slice of the routed experts. Rank 0 (leader) is a normal
+ * frontend session that mirrors every ds4_session_sync()/ds4_session_eval()
+ * call to every worker over a TCP control star, so all engines execute the
+ * identical graph sequence. Workers dial the leader; the leader assigns
+ * ranks 1..N-1 and broadcasts the full peer mesh.
+ * Inside each decoded token, partial block outputs are all-reduced through a
+ * registered memory slab: two-sided RDMA SEND/RECV per peer when RDMA over
+ * Thunderbolt is available, or a full-duplex TCP exchange per peer as
+ * fallback.  For N=2 the wire, slab layout, and gate exchanges are
+ * byte-identical to the original two-rank protocol.
+ *
+ * Control plane is a star on listen_port; the data plane is a full mesh on
+ * listen_port+1.  Pair (i<j): rank i accepts, rank j dials.  Each rank owns
+ * one slab in-region per peer (in_off + (peer-1)*S*vec), so an all-reduce
+ * writes its own partial to every peer's in-region and reads every peer's
+ * partial back.
  *
  * Layering: ds4.c calls the session-mirroring and slab entry points;
  * ds4_metal.m only ever sees ds4_tp_gate_exchange() through a callback
  * registered with the GPU gate machinery.  Nothing here touches tensors.
+ * Engine-side N-way sharding (vocab/expert split) and the Metal combine
+ * kernels are separate, out-of-scope work; this header is transport only.
  */
 
 typedef struct ds4_tp ds4_tp;
@@ -32,6 +43,10 @@ enum {
     DS4_TP_GATES_PER_LAYER = 2,
     /* Max rows in a verify-block batch gate (speculative blocks are <=5). */
     DS4_TP_BATCH_MAX_ROWS = 8,
+    /* Max TP ranks. A Thunderbolt full mesh needs each machine to hold N-1
+     * direct links; M4 Pro Mac Mini has 3 TB ports, and the verbs device
+     * caps at max_qp=11 (4-way = 3 QPs/rank fits). */
+    DS4_TP_MAX_RANKS = 4,
 };
 
 /* Engine identity exchanged in the hello so a mismatched pair aborts before
@@ -90,8 +105,10 @@ int ds4_tp_validate_engine_options(
         char *err,
         size_t errlen);
 
-/* Connection bring-up.  The leader listens and accepts one worker; the
- * worker dials with retry.  Both then exchange and validate identities.
+/* Connection bring-up.  The leader listens on listen_port and accepts N-1
+ * workers (control star); each worker dials with retry, sends its hello,
+ * and reads back its assigned rank + the full peer mesh.  Then the data
+ * mesh is established on listen_port+1 and identities are validated.
  * Blocking; call after the engine is loaded (identity needs the shape). */
 int ds4_tp_create(
         ds4_tp **out,
@@ -102,6 +119,7 @@ int ds4_tp_create(
 void ds4_tp_free(ds4_tp *tp);
 
 int ds4_tp_rank(const ds4_tp *tp);
+int ds4_tp_n_ranks(const ds4_tp *tp);
 bool ds4_tp_is_rdma(const ds4_tp *tp);
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
 bool ds4_tp_failed(const ds4_tp *tp);
@@ -112,16 +130,23 @@ void ds4_tp_mark_failed(ds4_tp *tp);
  * remote keys.  Layout, all offsets from base, S = n_layer * 2 slots:
  *
  *   out vectors   S * vec_bytes   written by local GPU kernels
- *   in  vectors   S * vec_bytes   RDMA/TCP-written with the peer partials
+ *   in  vectors   (N-1)*S*vec     RDMA/TCP-written peer partials; peer i
+ *                                 (rank 1..N-1) lands at in_off+(i-1)*S*vec
  *   in  seq flags S * 8           written strictly after each in vector
  *   token slot    16              {seq u64, token i32, pad} leader->worker
  *   (gpu flags, then batch out/in: n_layer * BATCH_MAX_ROWS * vec_bytes
  *    each, row partials for the speculative verify-block gates)
  *
- * vec_bytes = n_embd * 4 (f32 partials, never quantized on the wire). */
+ * vec_bytes = n_embd * 4 (f32 partials, never quantized on the wire).
+ * For N=2 the in region is exactly S*vec, i.e. identical to the original
+ * two-rank layout.  ds4_tp_slab_bytes() keeps the N=2 sizing (engine
+ * compat); use ds4_tp_slab_bytes_for() when allocating an N-rank slab. */
 uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd);
+uint64_t ds4_tp_slab_bytes_for(uint32_t n_layer, uint32_t n_embd, uint32_t n_ranks);
 uint64_t ds4_tp_slab_out_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate);
 uint64_t ds4_tp_slab_in_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate);
+uint64_t ds4_tp_slab_in_offset_peer(const ds4_tp *tp, uint32_t peer,
+                                    uint32_t layer, uint32_t gate);
 uint64_t ds4_tp_slab_batch_out_offset(const ds4_tp *tp, uint32_t layer);
 uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t layer);
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp);
@@ -215,6 +240,7 @@ typedef enum {
     DS4_TP_FRAME_RDMA_POSTED = 20,
     DS4_TP_FRAME_GLM_MTP = 21,
     DS4_TP_FRAME_SYNC_CHECKPOINT = 22,
+    DS4_TP_FRAME_MESH = 23,   /* data-mesh greet: dialer announces its rank */
 } ds4_tp_frame_type;
 
 typedef struct {

@@ -126,6 +126,7 @@ typedef struct {
     bool rdma_gid_index_set;
     bool glm_token_prefill;
     int debug_hash;             /* cross-check hidden state every N tokens */
+    int n_ranks;                 /* tensor-parallel rank count, 2..DS4_TP_MAX_RANKS */
 } ds4_tp_options;
 
 typedef struct {
