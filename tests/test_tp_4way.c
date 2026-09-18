@@ -9,6 +9,7 @@
  */
 #include "../ds4_tp.c"
 #include <assert.h>
+#include <math.h>
 
 #define NRANKS 4
 
@@ -122,6 +123,7 @@ static void check_mesh(void) {
             }
         }
     }
+
     for (unsigned r = 0; r < NRANKS; r++) {
         free(peer[r].tp.slab);
         for (unsigned pr = 0; pr < NRANKS; pr++)
@@ -198,8 +200,39 @@ static void check_batch_mesh(void) {
     puts("4-way TCP mesh: peer-indexed batch-in blocks hold each peer's rows: PASS");
 }
 
+/* N-way reduce: block 0 (in_offset) must become the sum of every peer's
+ * partial, not just the lowest peer.  Rank 0's peers are 1,2,3; peer 1 owns
+ * block 0, peers 2,3 own blocks 1,2. */
+static void check_combine(void) {
+    const unsigned n_embd = 5120;
+    const unsigned n_layer = 40;
+    const unsigned n_slots = n_layer * DS4_TP_GATES_PER_LAYER;
+    ds4_tp tp = {.rank = 0, .n_ranks = NRANKS, .n_layer = n_layer,
+        .n_slots = n_slots, .n_embd = n_embd,
+        .vec_bytes = (uint64_t)n_embd * sizeof(float)};
+    tp_slab_layout(&tp);
+    uint8_t *slab = calloc(1, ds4_tp_slab_bytes_for(n_layer, n_embd, NRANKS));
+    tp.slab = slab;
+    const unsigned layer = 3, gate = 1;
+    float *dst = (float *)(slab + ds4_tp_slab_in_offset(&tp, layer, gate));
+    for (unsigned i = 0; i < n_embd; i++) dst[i] = 0.25f * (float)i + 1.0f; /* peer 1 */
+    for (unsigned pr = 2; pr < NRANKS; pr++) {
+        float *src = (float *)(slab + ds4_tp_slab_in_offset_peer(&tp, pr, layer, gate));
+        for (unsigned i = 0; i < n_embd; i++) src[i] = 0.25f * (float)i + (float)pr;
+    }
+    ds4_tp_combine_slab(&tp, layer, gate);
+    for (unsigned i = 0; i < n_embd; i++) {
+        float expect = 0.25f * (float)i + 1.0f + 0.25f * (float)i + 2.0f +
+                       0.25f * (float)i + 3.0f;
+        assert(fabsf(dst[i] - expect) < 1e-3f);
+    }
+    free(slab);
+    puts("4-way N-way combine: block 0 sums all peers' partials: PASS");
+}
+
 int main(void) {
     check_mesh();
     check_batch_mesh();
+    check_combine();
     return 0;
 }

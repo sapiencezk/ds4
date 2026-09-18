@@ -72414,9 +72414,10 @@ static int ds4_engine_tp_exchange(void *ud, uint32_t layer, uint32_t gate, uint6
     const uint64_t bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     const uint64_t out = ds4_tp_slab_out_offset(tp, layer, gate);
     const uint64_t in = ds4_tp_slab_in_offset(tp, layer, gate);
+    const int xok = ds4_tp_gate_exchange(tp, layer, gate, seq);
+    if (xok) ds4_tp_combine_slab(tp, layer, gate);
     const int ok = (!e->tp.host_slab || ds4_gpu_tensor_read(e->tp.slab,
-            out, (char *)e->tp.host_slab + out, bytes)) &&
-        ds4_tp_gate_exchange(tp, layer, gate, seq) &&
+            out, (char *)e->tp.host_slab + out, bytes)) && xok &&
         (!e->tp.host_slab || ds4_gpu_tensor_write(e->tp.slab,
             in, (char *)e->tp.host_slab + in, bytes));
     if (!ok) ds4_tp_mark_failed(tp);
@@ -72431,9 +72432,10 @@ static int ds4_engine_tp_batch_exchange(void *ud, uint32_t layer,
     const uint64_t bytes = (uint64_t)rows * DS4_N_EMBD * sizeof(float);
     const uint64_t out = ds4_tp_slab_batch_out_offset(tp, layer);
     const uint64_t in = ds4_tp_slab_batch_in_offset(tp, layer);
+    const int xok = ds4_tp_batch_gate_exchange(tp, layer, rows, seq);
+    if (xok) ds4_tp_combine_slab_batch(tp, layer, rows);
     const int ok = (!e->tp.host_slab || ds4_gpu_tensor_read(e->tp.slab,
-            out, (char *)e->tp.host_slab + out, bytes)) &&
-        ds4_tp_batch_gate_exchange(tp, layer, rows, seq) &&
+            out, (char *)e->tp.host_slab + out, bytes)) && xok &&
         (!e->tp.host_slab || ds4_gpu_tensor_write(e->tp.slab,
             in, (char *)e->tp.host_slab + in, bytes));
     if (!ok) ds4_tp_mark_failed(tp);

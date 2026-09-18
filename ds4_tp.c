@@ -794,6 +794,45 @@ uint64_t ds4_tp_slab_in_offset_peer(const ds4_tp *tp, uint32_t peer,
            (uint64_t)tp_slot(tp, layer, gate) * tp->vec_bytes;
 }
 
+/* N-way reduction over the slab's CPU-accessible memory.  After the mesh
+ * exchange the per-gate in region holds one S*vec partial per peer (N-1
+ * blocks, block 0 == ds4_tp_slab_in_offset).  Sum every other peer's block
+ * into block 0 so a consumer reading in_offset sees the full partial sum.
+ * N=2: single block, no-op.  The transport slab is the CUDA host staging or
+ * Metal's CPU view of the GPU buffer, so the sum lands where kernels read. */
+void ds4_tp_combine_slab(ds4_tp *tp, uint32_t layer, uint32_t gate) {
+    uint32_t n = (uint32_t)tp->n_ranks;
+    if (n <= 2) return;
+    const uint64_t nf = tp->vec_bytes / sizeof(float);
+    float *dst = (float *)(tp->slab + ds4_tp_slab_in_offset(tp, layer, gate));
+    for (uint32_t pr = 0; pr < n; pr++) {
+        if (pr == (uint32_t)tp->rank) continue;
+        const uint32_t idx = pr < (uint32_t)tp->rank ? pr : pr - 1;
+        if (idx == 0) continue;      /* dst already holds block 0's partial */
+        const float *src = (const float *)(tp->slab +
+            ds4_tp_slab_in_offset_peer(tp, pr, layer, gate));
+        for (uint64_t i = 0; i < nf; i++) dst[i] += src[i];
+    }
+}
+
+/* Same reduction for a verify-block batch: sum the peers' batch-in blocks
+ * (one rows*vec block per peer) into block 0 == ds4_tp_slab_batch_in_offset.
+ * N=2: no-op. */
+void ds4_tp_combine_slab_batch(ds4_tp *tp, uint32_t layer, uint32_t rows) {
+    uint32_t n = (uint32_t)tp->n_ranks;
+    if (n <= 2) return;
+    const uint64_t nf = (uint64_t)rows * (tp->vec_bytes / sizeof(float));
+    float *dst = (float *)(tp->slab + ds4_tp_slab_batch_in_offset(tp, layer));
+    for (uint32_t pr = 0; pr < n; pr++) {
+        if (pr == (uint32_t)tp->rank) continue;
+        const uint32_t idx = pr < (uint32_t)tp->rank ? pr : pr - 1;
+        if (idx == 0) continue;
+        const float *src = (const float *)(tp->slab +
+            ds4_tp_slab_batch_in_offset_peer(tp, pr, layer));
+        for (uint64_t i = 0; i < nf; i++) dst[i] += src[i];
+    }
+}
+
 uint64_t ds4_tp_slab_batch_out_offset(const ds4_tp *tp, uint32_t layer) {
     return tp->batch_out_off +
            (uint64_t)layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
