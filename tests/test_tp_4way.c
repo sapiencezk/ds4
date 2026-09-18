@@ -39,6 +39,26 @@ static void *exchange(void *arg) {
     return NULL;
 }
 
+/* Verify-block batch gate: every peer's rows land in its own peer-indexed
+ * batch-in block for every layer. */
+static void *batch_exchange(void *arg) {
+    mesh_peer *p = arg;
+    ds4_tp *tp = &p->tp;
+    const unsigned n_layer = tp->n_layer;
+    for (unsigned step = 0; step < 32; step++) {
+        const unsigned layer = step % n_layer;
+        const unsigned rows = (step % DS4_TP_BATCH_MAX_ROWS) + 1;
+        pattern(tp->slab + ds4_tp_slab_batch_out_offset(tp, layer),
+                rows * tp->vec_bytes, p->rank);
+        if (!ds4_tp_batch_gate_exchange(tp, layer, rows, step + 1)) {
+            p->result = 0;
+            return NULL;
+        }
+    }
+    p->result = 1;
+    return NULL;
+}
+
 static void check_mesh(void) {
     const unsigned n_embd = 5120;
     const unsigned n_layer = 40;
@@ -110,7 +130,76 @@ static void check_mesh(void) {
     puts("4-way TCP mesh: peer-indexed in-regions hold each peer's partial: PASS");
 }
 
+static void check_batch_mesh(void) {
+    const unsigned n_embd = 5120;
+    const unsigned n_layer = 40;
+    mesh_peer peer[NRANKS] = {0};
+    pthread_t threads[NRANKS];
+
+    int fd[NRANKS][NRANKS];
+    for (unsigned i = 0; i < NRANKS; i++)
+        for (unsigned j = 0; j < NRANKS; j++) fd[i][j] = -1;
+    for (unsigned i = 0; i < NRANKS; i++) {
+        for (unsigned j = i + 1; j < NRANKS; j++) {
+            int pair[2];
+            assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+            fd[i][j] = pair[0];
+            fd[j][i] = pair[1];
+            for (unsigned k = 0; k < 2; k++) {
+#ifdef SO_NOSIGPIPE
+                int one = 1;
+                assert(setsockopt(pair[k], SOL_SOCKET, SO_NOSIGPIPE,
+                                  &one, sizeof(one)) == 0);
+#endif
+                assert(tp_socket_set_gate_timeout(pair[k], 1000));
+            }
+        }
+    }
+
+    for (unsigned r = 0; r < NRANKS; r++) {
+        peer[r].rank = r;
+        peer[r].tp = (ds4_tp){.rank = (int)r, .n_ranks = NRANKS,
+            .n_layer = n_layer, .n_slots = n_layer * DS4_TP_GATES_PER_LAYER,
+            .n_embd = n_embd, .vec_bytes = (uint64_t)n_embd * sizeof(float),
+            .gate_timeout_ms = 1000};
+        for (unsigned pr = 0; pr < NRANKS; pr++)
+            peer[r].tp.peers[pr].data_fd = fd[r][pr];
+        peer[r].tp.data_fd = r == 1 ? fd[r][0] : fd[r][1];
+        tp_slab_layout(&peer[r].tp);
+        peer[r].tp.slab = calloc(1, ds4_tp_slab_bytes_for(n_layer, n_embd, NRANKS));
+        assert(peer[r].tp.slab);
+        assert(pthread_create(&threads[r], NULL, batch_exchange, &peer[r]) == 0);
+    }
+    for (unsigned r = 0; r < NRANKS; r++) {
+        assert(pthread_join(threads[r], NULL) == 0 && peer[r].result);
+    }
+
+    /* Every rank's batch-in region must hold every peer's rows at the
+     * peer-indexed offset for every exchanged layer. */
+    for (unsigned r = 0; r < NRANKS; r++) {
+        ds4_tp *tp = &peer[r].tp;
+        for (unsigned step = 0; step < 32; step++) {
+            const unsigned layer = step % tp->n_layer;
+            const unsigned rows = (step % DS4_TP_BATCH_MAX_ROWS) + 1;
+            for (unsigned pr = 0; pr < NRANKS; pr++) {
+                if (pr == r) continue;
+                unsigned char *p = tp->slab +
+                    ds4_tp_slab_batch_in_offset_peer(tp, pr, layer);
+                for (unsigned i = 0; i < rows * tp->vec_bytes; i++)
+                    assert(p[i] == (unsigned char)(i * 37 + pr));
+            }
+        }
+    }
+    for (unsigned r = 0; r < NRANKS; r++) {
+        free(peer[r].tp.slab);
+        for (unsigned pr = 0; pr < NRANKS; pr++)
+            if (fd[r][pr] >= 0) close(fd[r][pr]);
+    }
+    puts("4-way TCP mesh: peer-indexed batch-in blocks hold each peer's rows: PASS");
+}
+
 int main(void) {
     check_mesh();
+    check_batch_mesh();
     return 0;
 }

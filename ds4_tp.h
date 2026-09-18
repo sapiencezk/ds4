@@ -149,6 +149,8 @@ uint64_t ds4_tp_slab_in_offset_peer(const ds4_tp *tp, uint32_t peer,
                                     uint32_t layer, uint32_t gate);
 uint64_t ds4_tp_slab_batch_out_offset(const ds4_tp *tp, uint32_t layer);
 uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t layer);
+uint64_t ds4_tp_slab_batch_in_offset_peer(const ds4_tp *tp, uint32_t peer,
+                                          uint32_t layer);
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp);
 int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen);
 /* Stop the data plane before freeing its registered buffers. No more gates

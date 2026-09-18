@@ -732,17 +732,19 @@ uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd) {
            (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec * 2; /* batch out+in */
 }
 
-/* N-rank slab: the in region holds one S*vec block per peer (N-1 blocks).
+/* N-rank slab: the in region holds one S*vec block per peer (N-1 blocks),
+ * and the batch-in region holds one rows*vec block per peer (N-1 blocks).
  * For N=2 this equals ds4_tp_slab_bytes(). */
 uint64_t ds4_tp_slab_bytes_for(uint32_t n_layer, uint32_t n_embd,
                                uint32_t n_ranks) {
     uint64_t vec = (uint64_t)n_embd * sizeof(float);
     uint64_t slots = (uint64_t)n_layer * DS4_TP_GATES_PER_LAYER;
-    return slots * vec * n_ranks +  /* out + (N-1) in vectors */
+    uint32_t nr = n_ranks < 2 ? 2 : n_ranks;
+    return slots * vec * nr +  /* out + (N-1) in vectors */
            slots * 8 * 2 +      /* in flags + out flag staging */
            16 +                 /* token slot */
            slots * 4 +          /* GPU-written gate-ready flags */
-           (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec * 2; /* batch out+in */
+           (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec * nr; /* batch out + (N-1) in */
 }
 
 static void tp_slab_layout(ds4_tp *tp) {
@@ -760,7 +762,8 @@ static void tp_slab_layout(ds4_tp *tp) {
     tp->batch_in_off = tp->batch_out_off +
                        (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
     tp->slab_bytes = tp->batch_in_off +
-                     (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
+                     (uint64_t)(nr - 1) * tp->n_layer *
+                     DS4_TP_BATCH_MAX_ROWS * vec;
 }
 
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp) {
@@ -798,6 +801,17 @@ uint64_t ds4_tp_slab_batch_out_offset(const ds4_tp *tp, uint32_t layer) {
 
 uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t layer) {
     return tp->batch_in_off +
+           (uint64_t)layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
+}
+
+/* Peer's verify-block rows land in the batch-in region ordered by rank with
+ * self removed (same ordering as the per-gate in region). */
+uint64_t ds4_tp_slab_batch_in_offset_peer(const ds4_tp *tp, uint32_t peer,
+                                          uint32_t layer) {
+    const uint32_t idx = peer < (uint32_t)tp->rank ? peer : peer - 1;
+    return tp->batch_in_off +
+           (uint64_t)idx * (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS *
+           tp->vec_bytes +
            (uint64_t)layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
 }
 
@@ -2712,40 +2726,48 @@ int ds4_tp_batch_block_end(ds4_tp *tp) {
 #endif
 }
 
-int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
-                               uint64_t seq) {
+/* One verify-block batch gate to peer `peer` over TCP.  The peer's rows land
+ * in its peer-indexed batch-in block (block 0 for N=2, byte-identical). */
+static int tp_tcp_batch_exchange_peer(ds4_tp *tp, uint32_t peer,
+                                      uint32_t layer, uint32_t rows,
+                                      uint64_t seq) {
+    const int fd = tp_peer_data_fd(tp, peer);
+    if (fd < 0 || rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS) return 0;
+    const uint64_t bytes = (uint64_t)rows * tp->vec_bytes;
+    ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer,
+                             (uint16_t)rows, seq };
+    ds4_tp_gate_header ph;
+    if (!tp_tcp_exchange(tp, fd, &h, &ph,
+            tp->slab + ds4_tp_slab_batch_out_offset(tp, layer),
+            tp->slab + ds4_tp_slab_batch_in_offset_peer(tp, peer, layer),
+            bytes)) return 0;
+    if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
+        ph.gate != rows || ph.seq != seq) {
+        fprintf(stderr,
+                "ds4-tp: batch gate desync (peer %u): got l=%u rows=%u seq=%llu, "
+                "want l=%u rows=%u seq=%llu\n",
+                peer, ph.layer, ph.gate, (unsigned long long)ph.seq,
+                layer, rows, (unsigned long long)seq);
+        return 0;
+    }
+    return 1;
+}
+
+/* Verify-block batch gate over the RDMA peer1 link (worker1).  For N=2 this
+ * is the sole peer and the path is byte-identical to the original. */
+#ifdef DS4_TP_HAVE_VERBS
+static int tp_rdma_batch_gate_exchange(ds4_tp *tp, uint32_t layer,
+                                       uint32_t rows, uint64_t seq) {
     if (tp->data_fd < 0 || rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS) return 0;
     const uint64_t bytes = (uint64_t)rows * tp->vec_bytes;
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer,
                              (uint16_t)rows, seq };
-#ifdef DS4_TP_HAVE_VERBS
-    if (tp->rdma_active && tp->rdma.block_active)
+    if (tp->rdma.block_active)
         return tp_rdma_block_gate_exchange(tp, layer, rows);
-    if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
-        if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
-        ds4_tp_gate_header ph;
-        if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
-        if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
-            ph.gate != rows || ph.seq != seq) {
-            fprintf(stderr,
-                    "ds4-tp: batch gate desync: got l=%u rows=%u seq=%llu, "
-                    "want l=%u rows=%u seq=%llu\n",
-                    ph.layer, ph.gate, (unsigned long long)ph.seq,
-                    layer, rows, (unsigned long long)seq);
-            return 0;
-        }
-        if (!tp_rdma_drain_decode_window(tp)) return 0;
-        return tp_rdma_big_gate_exchange(
-                tp,
-                tp->slab + ds4_tp_slab_batch_out_offset(tp, layer),
-                tp->slab + ds4_tp_slab_batch_in_offset(tp, layer),
-                bytes);
-    }
-#endif
+    if (!tp_rdma_big_gate_capable(tp)) return 0;
+    if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
     ds4_tp_gate_header ph;
-    if (!tp_tcp_exchange(tp, tp->data_fd, &h, &ph,
-            tp->slab + ds4_tp_slab_batch_out_offset(tp, layer),
-            tp->slab + ds4_tp_slab_batch_in_offset(tp, layer), bytes)) return 0;
+    if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
     if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
         ph.gate != rows || ph.seq != seq) {
         fprintf(stderr,
@@ -2754,6 +2776,34 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                 ph.layer, ph.gate, (unsigned long long)ph.seq,
                 layer, rows, (unsigned long long)seq);
         return 0;
+    }
+    if (!tp_rdma_drain_decode_window(tp)) return 0;
+    return tp_rdma_big_gate_exchange(
+            tp,
+            tp->slab + ds4_tp_slab_batch_out_offset(tp, layer),
+            tp->slab + ds4_tp_slab_batch_in_offset(tp, layer),
+            bytes);
+}
+#endif
+
+/* N-way batch gate: RDMA exchanges with peer1 then TCP fallback to peers
+ * 2..N-1 (mirrors gate_exchange); a plain TCP transport exchanges every peer
+ * over the mesh.  For N=2 this is exactly the original single-peer exchange. */
+int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
+                               uint64_t seq) {
+    uint32_t pr;
+#ifdef DS4_TP_HAVE_VERBS
+    if (tp->rdma_active) {
+        if (!tp_rdma_batch_gate_exchange(tp, layer, rows, seq)) return 0;
+        for (pr = 2; pr < tp->n_ranks; pr++) {
+            if (!tp_tcp_batch_exchange_peer(tp, pr, layer, rows, seq)) return 0;
+        }
+        return 1;
+    }
+#endif
+    for (pr = 0; pr < tp->n_ranks; pr++) {
+        if (pr == (uint32_t)tp->rank) continue;
+        if (!tp_tcp_batch_exchange_peer(tp, pr, layer, rows, seq)) return 0;
     }
     return 1;
 }
