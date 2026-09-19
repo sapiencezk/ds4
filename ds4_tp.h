@@ -276,6 +276,11 @@ int ds4_tp_hash_check(ds4_tp *tp, uint64_t seq, uint64_t hash, char *err, size_t
  * after every eval (and after a sync) on the control socket. */
 int ds4_tp_send_logits_half(ds4_tp *tp, const float *half, uint32_t count);
 int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count);
+/* Leader-side N-way logits gather: read one slice of count floats from every
+ * worker (peer 1 on the scalar control link, peers 2..N-1 on their mesh
+ * control links) and place each at dst[peer*count].  N=2 reads peer 1's slice
+ * into dst+count, exactly recv_logits_half(dst+count, count). */
+int ds4_tp_recv_logits_gather(ds4_tp *tp, float *dst, uint32_t count);
 
 /* Speculative verify mirroring.  The leader announces a draft block right
  * before both ranks run the expert-split batch verify; the worker then blocks

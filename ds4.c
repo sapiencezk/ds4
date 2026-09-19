@@ -72481,7 +72481,9 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     }
     const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
     const uint64_t vec_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
-    const uint64_t slab_bytes = ds4_tp_slab_bytes((uint32_t)DS4_N_LAYER, (uint32_t)DS4_N_EMBD);
+    const uint32_t n_ranks = (uint32_t)ds4_tp_n_ranks(tp);
+    const uint64_t slab_bytes = ds4_tp_slab_bytes_for(
+            (uint32_t)DS4_N_LAYER, (uint32_t)DS4_N_EMBD, n_ranks);
     e->tp.ctx = tp;
     e->tp.slab = ds4_gpu_tensor_alloc(slab_bytes);
     e->tp.zero_vec = ds4_gpu_tensor_alloc(vec_bytes);

@@ -3456,6 +3456,32 @@ int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count) {
     return tp_read_full(tp->control_fd, half, count * sizeof(float));
 }
 
+/* Leader-side N-way logits gather: read one slice of count floats from every
+ * worker and place each at dst[peer*count].  Peer 1 arrives on the scalar
+ * control_fd link; workers 2..N-1 on their mesh control links.  The leader
+ * must have registered every worker's control link (peers[p].control_fd).
+ * N=2 reads peer 1's slice into dst+count. */
+int ds4_tp_recv_logits_gather(ds4_tp *tp, float *dst, uint32_t count) {
+    const uint32_t n = (uint32_t)ds4_tp_n_ranks(tp);
+    if (n <= 1) return 1;
+    uint32_t type = 0, bytes = 0;
+    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+        type != DS4_TP_FRAME_LOGITS || bytes != count * sizeof(float) ||
+        !tp_read_full(tp->control_fd, dst + (uint64_t)1 * count,
+                      count * sizeof(float)))
+        return 0;
+    for (uint32_t p = 2; p < n; p++) {
+        const int fd = tp->peers[p].control_fd;
+        if (fd < 0) return 0;
+        type = 0; bytes = 0;
+        if (!tp_read_frame_header(fd, &type, &bytes) ||
+            type != DS4_TP_FRAME_LOGITS || bytes != count * sizeof(float) ||
+            !tp_read_full(fd, dst + (uint64_t)p * count, count * sizeof(float)))
+            return 0;
+    }
+    return 1;
+}
+
 int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
                        const int *drafts, uint32_t n) {
     return tp_send_token_command(tp, DS4_TP_FRAME_VERIFY, session_id,

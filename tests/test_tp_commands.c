@@ -1,5 +1,6 @@
 #include "../ds4_tp.c"
 #include <assert.h>
+#include <math.h>
 #include <pthread.h>
 
 typedef struct {
@@ -190,11 +191,59 @@ static void check_logits_halves(void) {
     puts("TP logits halves: exact frames, reuse, canaries, EOF, invalid frames and timeout: ok");
 }
 
+/* 4-way leader logits gather: rank 0 receives one slice from each worker
+ * (peer 1 on the scalar control link, peers 2,3 on their mesh control links)
+ * and places each at dst[peer*slice]. */
+static void check_logits_gather_4way(void) {
+    const uint32_t slice = 8;
+    float dst[4 * slice];
+    const uint32_t canary = UINT32_C(0xa5a5a5a5);
+    int fd01[2], fd02[2], fd03[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd01) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd02) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd03) == 0);
+    ds4_tp leader = {.rank = 0, .n_ranks = 4, .control_fd = fd01[0]};
+    leader.peers[2].control_fd = fd02[0];
+    leader.peers[3].control_fd = fd03[0];
+    ds4_tp worker[3] = {{.rank = 1, .n_ranks = 4, .control_fd = fd01[1]},
+                        {.rank = 2, .n_ranks = 4, .control_fd = fd02[1]},
+                        {.rank = 3, .n_ranks = 4, .control_fd = fd03[1]}};
+    for (unsigned repeat = 0; repeat < 3; repeat++) {
+        for (unsigned pr = 1; pr <= 3; pr++) {
+            float slice_data[slice];
+            for (uint32_t i = 0; i < slice; i++) slice_data[i] = 100.0f * (float)pr + (float)i;
+            assert(ds4_tp_send_logits_half(&worker[pr - 1], slice_data, slice));
+        }
+        memset(dst, 0xa5, sizeof(dst));
+        assert(ds4_tp_recv_logits_gather(&leader, dst, slice));
+        for (unsigned pr = 1; pr <= 3; pr++) {
+            for (uint32_t i = 0; i < slice; i++)
+                assert(fabsf(dst[pr * slice + i] - (100.0f * (float)pr + (float)i)) < 1e-3f);
+        }
+        /* Slice 0 (the leader's own) is never written by the gather. */
+        float canary_f;
+        memcpy(&canary_f, &canary, sizeof(canary_f));
+        assert(dst[0] == canary_f && dst[slice - 1] == canary_f);
+    }
+    /* A missing worker slice (EOF) fails the whole gather. */
+    assert(shutdown(fd03[1], SHUT_WR) == 0);
+    float slice_data[slice];
+    for (uint32_t i = 0; i < slice; i++) slice_data[i] = (float)i;
+    assert(ds4_tp_send_logits_half(&worker[0], slice_data, slice));
+    assert(ds4_tp_send_logits_half(&worker[1], slice_data, slice));
+    assert(!ds4_tp_recv_logits_gather(&leader, dst, slice));
+    close(fd01[0]); close(fd01[1]);
+    close(fd02[0]); close(fd02[1]);
+    close(fd03[0]); close(fd03[1]);
+    puts("4-way logits gather: leader sums every worker slice into dst: ok");
+}
+
 int main(void) {
     check_backend_options();
     check_bulk_exchange();
     check_sync_cancellation();
     check_logits_halves();
+    check_logits_gather_4way();
     int fd[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
     ds4_tp leader = { .control_fd = fd[0] };
