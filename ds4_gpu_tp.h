@@ -24,6 +24,9 @@ typedef int (*ds4_gpu_tp_big_exchange_fn)(void *ud, uint32_t layer,
 int ds4_gpu_tp_init(uint32_t rank, ds4_gpu_tensor *slab,
                     uint64_t gpu_flags_off, uint64_t out_off, uint64_t vec_bytes,
                     ds4_gpu_tp_exchange_fn fn, void *ud);
+/* Set the TP world size (number of split ranks) after init; 1 = no split.
+ * Metal splits experts / heads / output rows N ways; CUDA TP stays 2-way. */
+void ds4_gpu_tp_set_world(int world);
 void ds4_gpu_tp_shutdown(void);
 int ds4_gpu_tp_failed(void);
 int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate);

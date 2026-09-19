@@ -10230,28 +10230,39 @@ static uint64_t g_tp_batch_seq;
  * not bound; world 2 assigns each rank one contiguous expert range. */
 static int32_t g_tp_split_rank;
 static int32_t g_tp_split_world = 1;
+static int32_t g_tp_split_world_saved = 1;
 static int32_t g_tp_session_batch_mode;
+
+/* Set the TP world size (number of split ranks) after init.  World 1 = no
+ * split; world N>1 splits experts / heads / output rows N ways.  N=2 is the
+ * original contract. */
+void ds4_gpu_tp_set_world(int world) {
+    if (world < 1) world = 1;
+    if (world > 4) world = 4;   /* DS4_TP_MAX_RANKS */
+    g_tp_split_world = world;
+    g_tp_split_world_saved = world;
+}
 
 static int ds4_gpu_tp_world_is_two(void) {
     return g_tp_split_world == 2;
 }
 
-/* Return the contiguous routed-expert range backed by this process. Rank 1
- * owns the high range and receives any odd-count remainder. */
+/* Return the contiguous routed-expert range backed by this process. Each
+ * rank owns an equal contiguous slice; the last rank receives any odd-count
+ * remainder.  World 2 keeps the two-rank arithmetic identical (rank 0 low
+ * half, rank 1 high half + remainder). */
 static void ds4_gpu_tp_expert_range(uint32_t n_total_expert,
                                     uint32_t *first_expert,
                                     uint32_t *n_expert) {
     *first_expert = 0;
     *n_expert = n_total_expert;
-    if (g_tp_split_world != 2) return;
+    const uint32_t world = (uint32_t)g_tp_split_world;
+    if (world <= 1) return;
 
-    const uint32_t low_experts = n_total_expert / 2u;
-    if (g_tp_split_rank == 1) {
-        *first_expert = low_experts;
-        *n_expert = n_total_expert - low_experts;
-    } else {
-        *n_expert = low_experts;
-    }
+    const uint32_t rank = (uint32_t)g_tp_split_rank;
+    const uint32_t chunk = n_total_expert / world;
+    *first_expert = rank * chunk;
+    *n_expert = (rank == world - 1) ? n_total_expert - *first_expert : chunk;
 }
 
 /* Attention head split for GLM batch prefill: each rank computes a
@@ -10271,11 +10282,12 @@ static void ds4_gpu_tp_attn_head_range(uint32_t n_head,
                                        uint32_t *head_count) {
     *head_base = 0;
     *head_count = n_head;
-    if (!g_tp_attn_head_split || g_tp_split_world != 2) return;
-    const uint32_t half = n_head / 2u;
-    if (half == 0u || (half % group) != 0u || (n_head % 2u) != 0u) return;
-    *head_count = half;
-    *head_base = g_tp_split_rank == 1 ? half : 0u;
+    if (!g_tp_attn_head_split || g_tp_split_world <= 1) return;
+    const uint32_t world = (uint32_t)g_tp_split_world;
+    const uint32_t chunk = n_head / world;
+    if (chunk == 0u || (chunk % group) != 0u || (n_head % world) != 0u) return;
+    *head_count = chunk;
+    *head_base = (uint32_t)g_tp_split_rank * chunk;
 }
 /* Flag gates (DS4_TP_FLAG_GATES): the GPU publishes gate arrival by storing
  * the sequence number into a slab word instead of signaling the shared
@@ -10779,9 +10791,12 @@ int ds4_gpu_tp_init(uint32_t rank,
                     uint64_t out_off, uint64_t vec_bytes,
                     ds4_gpu_tp_exchange_fn fn, void *ud) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (g_tp_thread_running || rank > 1) return 0;
+    /* ds4_tp.h caps TP world size at DS4_TP_MAX_RANKS (4); a worker rank up
+     * to world-1 is a valid local TP process. */
+    if (g_tp_thread_running || rank >= 4) return 0;
     g_tp_split_rank = (int32_t)rank;
     g_tp_split_world = 2;
+    g_tp_split_world_saved = 2;
     g_tp_slab_buffer = slab ? ds4_gpu_tensor_buffer(slab) : nil;
     g_tp_slab_buffer_off = slab ? ds4_gpu_tensor_offset(slab) : 0;
     g_tp_gpu_flags_off = gpu_flags_off;
@@ -10911,7 +10926,7 @@ void ds4_gpu_tp_shutdown(void) {
 
 void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
     if (!g_tp_thread_running) return;
-    g_tp_split_world = suspend ? 1 : 2;
+    g_tp_split_world = suspend ? 1 : g_tp_split_world_saved;
 }
 
 /* Fold request for producers that write the TP partial with a generic matvec
@@ -26209,8 +26224,11 @@ int ds4_gpu_dsv41_attention_output_tp_batch(
         uint64_t out_a_offset, uint64_t out_b_offset,
         const ds4_gpu_tensor *heads, uint32_t n_tokens, uint32_t tp_rank) {
     const uint64_t shard_bytes = UINT64_C(4) * 1024 * (4096 / 32 * 34);
-    if (tp_rank > 1 || out_a_offset > model_size ||
-        shard_bytes * 2u > model_size - out_a_offset) return 0;
+    /* The shard is callable without a bound TP (world stays 1); treat that as
+     * the 2-way case.  A bound world>2 widens the allowed rank range. */
+    const int32_t world = g_tp_split_world > 1 ? g_tp_split_world : 2;
+    if ((int32_t)tp_rank >= world || out_a_offset > model_size ||
+        shard_bytes * (uint64_t)world > model_size - out_a_offset) return 0;
     return ds4_gpu_attention_output_q8_batch_impl(out, low, low, low,
         model_map, model_size, out_a_offset + tp_rank * shard_bytes, out_b_offset,
         4096, 1024, 4, 5120, heads, n_tokens, true, 8192, tp_rank * 4096u);

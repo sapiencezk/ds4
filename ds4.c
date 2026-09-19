@@ -72544,6 +72544,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         snprintf(err, errlen, "tp: gate service init failed");
         goto fail;
     }
+    ds4_gpu_tp_set_world((int)ds4_tp_n_ranks(tp));
     ds4_gpu_tp_set_batch_exchange(ds4_engine_tp_batch_exchange);
 #ifdef __APPLE__
     g_tp_block_ctx = tp;
@@ -72828,7 +72829,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->ds41_graph_ready = true;
         s->ds41_graph.quality = e->quality;
         if (e->tp.active) {
-            s->ds41_graph.tp_world = 2;
+            s->ds41_graph.tp_world = (uint32_t)ds4_tp_n_ranks(e->tp.ctx);
             s->ds41_graph.tp_rank = (uint32_t)e->tp.rank;
             s->ds41_graph.tp_out = e->tp.out_views;
             s->ds41_graph.tp_in = e->tp.in_views;
@@ -73004,7 +73005,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->glm_graph.ssd_streaming_cold = e->ssd_streaming_cold;
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
         if (e->tp.active) {
-            s->glm_graph.tp_world = 2;
+            s->glm_graph.tp_world = (uint32_t)ds4_tp_n_ranks(e->tp.ctx);
             s->glm_graph.tp_rank = (uint32_t)e->tp.rank;
             s->glm_graph.tp_out = e->tp.out_views;
             s->glm_graph.tp_in = e->tp.in_views;
@@ -73139,7 +73140,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->graph.deepseek4_vision_weights = &e->deepseek4_vision_weights;
     }
     if (e->tp.active) {
-        s->graph.tp_world = 2;
+        s->graph.tp_world = (uint32_t)ds4_tp_n_ranks(e->tp.ctx);
         s->graph.tp_rank = (uint32_t)e->tp.rank;
         s->graph.tp_out = e->tp.out_views;
         s->graph.tp_in = e->tp.in_views;

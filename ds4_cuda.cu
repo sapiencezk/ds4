@@ -33640,6 +33640,12 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank, ds4_gpu_tensor *slab,
     return 1;
 }
 
+/* CUDA TP is a 2-way partner split; N-way is the Metal TCP path.  Accept the
+ * world for API symmetry but keep the 2-way data plane (cluster-gated). */
+extern "C" void ds4_gpu_tp_set_world(int world) {
+    (void)world;
+}
+
 extern "C" void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) {
     g_cuda_tp.batch = fn;
 }
